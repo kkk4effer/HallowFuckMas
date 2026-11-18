@@ -1,0 +1,6 @@
+{
+  "name": "BruceLink NFC Bridge",
+  "description": "Chrome extension and Android APK builder that accesses device NFC in a Google Wallet-style interface, continuously reroutes TX/RX over USB to an ESP32-C6 running Bruce Firmware, and compiles an installable APK with a $5 CashApp paywall ($EfferGamePix).",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
