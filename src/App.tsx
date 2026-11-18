@@ -1,896 +1,696 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { TopBar } from './components/TopBar';
-import { NfcBridgePage } from './components/NfcBridgePage';
-import { BruceCompanionPage } from './components/BruceCompanionPage';
-import { NdefTagFilesPage } from './components/NdefTagFilesPage';
-import { ExtensionDownloadPage } from './components/ExtensionDownloadPage';
-import { ApkBuilderPage } from './components/ApkBuilderPage';
+import { Nfc, Wifi } from 'lucide-react';
+import { TopNav } from './components/TopNav';
+import { LilyGoTEmbedEmulator } from './components/LilyGoTEmbedEmulator';
+import { NfcFetchPanel } from './components/NfcFetchPanel';
+import { WifiTxRxPanel } from './components/WifiTxRxPanel';
+import { FirmwarePanel } from './components/FirmwarePanel';
+import { CarrierUnlockPanel } from './components/CarrierUnlockPanel';
 import {
-  DEFAULT_NFC_PASSES,
-  buildBruceNfcFrame,
-  buildKeepAliveFrame,
-  createNdefReader,
-  createPacket,
-  formatTimeStamp,
-  isWebSerialSupported,
-  requestEsp32SerialPort,
-  stringToHex,
-  writeBytesToSerialPort,
-} from './services/usbSerialService';
+  buildBruceFirmwareBinary,
+  clearPersistedFlashState,
+  loadPersistedFlashState,
+  parseUploadedFirmwareFile,
+  savePersistedFlashState,
+  triggerFirmwareBinDownload,
+} from './services/bruceFirmwareService';
 import {
-  buildAllTagsArchiveBytes,
-  buildNdefTagFile,
-  convertSerialPacketToCardPass,
-  convertSerialPacketToNdefTag,
-  getDefaultNdefTagFiles,
-  isRawPacketConvertible,
-} from './services/ndefService';
-import { triggerBrowserDownload } from './services/extensionPackager';
+  NFC_FETCH_PRESETS,
+  createPhoneNdefReader,
+  dataViewToHexPairs,
+  formatClockTime,
+  parseNfcDumpFileText,
+  stringToHexPairs,
+} from './services/nfcHardwareService';
+import {
+  buildTxRxFrame,
+  createEsp32BruceTxAck,
+  encodeNfcTagForWifiRx,
+} from './services/wifiTxRxBridge';
 import type {
-  BruceModuleMode,
-  BruceRelayedReading,
-  NdefRecordType,
-  NdefTagFile,
-  NfcCardPass,
-  NfcProtocol,
-  PageId,
-  SerialPacket,
-  UsbBridgeState,
-  WebSerialPort,
-} from './types/nfc';
+  BruceAppId,
+  FirmwareBinaryInfo,
+  FirmwareBootState,
+  FlashLogEntry,
+  NavTab,
+  NfcTagRecord,
+  TxRxFrame,
+  WifiTxRxConfig,
+} from './types/hardware';
 
-const INITIAL_READINGS: BruceRelayedReading[] = [
-  {
-    id: 'rel-init-1',
-    timestamp: formatTimeStamp(),
-    source: 'Phone WebNFC -> USB TX',
-    uid: '04:A3:7F:92:1B:44:80',
-    protocol: 'ISO14443-A',
-    atqa: '0x0044',
-    sak: '0x20',
-    ndefPayload: 'bruce://nfc-relay?target=esp32c6&tx=GPIO16&rx=GPIO17',
-    rawFrameHex: 'AA 55 10 4A 4E 46 43 7C 49 53 4F 31 34 34 34 33 2D 41 0A',
-    rssiDbm: -42,
-  },
-  {
-    id: 'rel-init-2',
-    timestamp: formatTimeStamp(),
-    source: 'ESP32-C6 Bruce RX -> Chrome',
-    uid: '9A:41:C0:2E',
-    protocol: 'MIFARE Classic 1K',
-    atqa: '0x0004',
-    sak: '0x08',
-    ndefPayload: 'TRANSIT:ZONE-1|BAL:$24.50|SEQ:0891',
-    rawFrameHex: 'AA 55 10 38 4E 46 43 7C 4D 49 46 41 52 45 7C 39 41 3A 34 31 0A',
-    rssiDbm: -48,
-  },
-];
+const INITIAL_FIRMWARE: FirmwareBinaryInfo = {
+  fileName: 'bruce-lilygo-t-embed-cc1101-v1.9.1.bin',
+  version: '1.9.1',
+  board: 'LilyGO T-Embed CC1101',
+  mcu: 'ESP32-S3R8 (Dual-Core 240MHz)',
+  flashOffset: '0x10000',
+  sizeBytes: 65536,
+  sha256: 'preparing-sha256...',
+  isCustom: false,
+  bytes: new Uint8Array(65536),
+};
 
 export default function App() {
-  const [activePage, setActivePage] = useState<PageId>('bridge');
-  const [combinedDualMode, setCombinedDualMode] = useState<boolean>(true);
-  const [passes, setPasses] = useState<NfcCardPass[]>(DEFAULT_NFC_PASSES);
-  const [selectedPassId, setSelectedPassId] = useState<string>(DEFAULT_NFC_PASSES[0].id);
+  const [activeTab, setActiveTab] = useState<NavTab>('emulator');
+  const [bootState, setBootState] = useState<FirmwareBootState>('stock');
+  const [activeApp, setActiveApp] = useState<BruceAppId>('menu');
+  const [firmware, setFirmware] = useState<FirmwareBinaryInfo>(INITIAL_FIRMWARE);
+  const [flashProgress, setFlashProgress] = useState(0);
+  const [flashLogs, setFlashLogs] = useState<FlashLogEntry[]>([]);
+  const [toastNotice, setToastNotice] = useState<string | null>(null);
 
-  const [tagFiles, setTagFiles] = useState<NdefTagFile[]>(() => getDefaultNdefTagFiles());
-  const [emulatingTagId, setEmulatingTagId] = useState<string | null>(null);
-  const [convertedPacketIds, setConvertedPacketIds] = useState<Record<string, boolean>>({});
-  const [autoConvertRawToTags, setAutoConvertRawToTags] = useState<boolean>(false);
+  const [tags, setTags] = useState<NfcTagRecord[]>(NFC_FETCH_PRESETS);
+  const [activeTagId, setActiveTagId] = useState<string | null>(NFC_FETCH_PRESETS[0].id);
 
-  const [usbState, setUsbState] = useState<UsbBridgeState>({
-    mode: 'virtual',
-    portName: 'ESP32-C6 Loopback (CDC0)',
+  const [wifiConfig, setWifiConfig] = useState<WifiTxRxConfig>({
+    transport: 'onboard-tunnel',
+    wifiMode: 'AP (192.168.4.1)',
+    ssid: 'Bruce-TEmbed-Bridge',
+    wsUrl: 'ws://192.168.4.1:81/ws',
+    wsConnected: false,
     baudRate: 115200,
-    dataBits: 8,
-    stopBits: 1,
-    parity: 'none',
-    dtr: true,
-    rts: false,
-    txPin: 'GPIO16 (U0TXD)',
-    rxPin: 'GPIO17 (U0RXD)',
-    keepAliveEnabled: true,
-    wakeLockActive: false,
-    webNfcScanning: false,
-    txBytesTotal: 0,
-    rxBytesTotal: 0,
-    txPacketsTotal: 0,
-    rxPacketsTotal: 0,
-    lastHeartbeatAt: null,
+    txPin: 'GPIO43 (TX)',
+    rxPin: 'GPIO44 (RX)',
+    txEnabled: true,
+    rxEnabled: true,
+    autoForwardNfc: true,
+    txBytes: 0,
+    rxBytes: 0,
+    txFrames: 0,
+    rxFrames: 0,
   });
 
-  const [packets, setPackets] = useState<SerialPacket[]>([
-    createPacket(
+  const [frames, setFrames] = useState<TxRxFrame[]>(() => [
+    buildTxRxFrame(
       'TX',
-      'SYSTEM',
-      'AA 55 01 0E 42 52 55 43 45 5F 42 52 49 44 47 45 0A',
-      'BruceLink USB TX/RX Bridge initialized (115200 8N1)'
+      'WIFI_TX_GPIO43',
+      'Wi-Fi UART Bridge initialized (TX=GPIO43, RX=GPIO44, 115200 8N1)',
+      'WIFI_BRIDGE_INIT|TX=43|RX=44|BAUD=115200'
     ),
-    createPacket(
+    buildTxRxFrame(
       'RX',
-      'BRUCE_CMD',
-      '5B 42 52 55 43 45 5D 20 45 53 50 33 32 2D 43 36 20 52 45 41 44 59 0A',
-      '[BRUCE] ESP32-C6 NFC Relay Ready on UART0'
+      'WIFI_RX_GPIO44',
+      '[GPIO44_RX] ESP32-S3 Onboard Wi-Fi Bridge Ready',
+      '[GPIO44_RX] ESP32-S3 Onboard Wi-Fi Bridge Ready'
     ),
   ]);
 
-  const [relayedReadings, setRelayedReadings] =
-    useState<BruceRelayedReading[]>(INITIAL_READINGS);
-  const [statusNotice, setStatusNotice] = useState<string | null>(null);
+  const [txPulseAt, setTxPulseAt] = useState(0);
+  const [rxPulseAt, setRxPulseAt] = useState(0);
 
-  const serialPortRef = useRef<WebSerialPort | null>(null);
-  const readerCancelRef = useRef<(() => void) | null>(null);
-  const wakeLockRef = useRef<{ release: () => Promise<void> } | null>(null);
-  const keepAliveSeqRef = useRef<number>(1);
-  const autoConvertRef = useRef<boolean>(false);
+  const wsRef = useRef<WebSocket | null>(null);
+  const bcRef = useRef<BroadcastChannel | null>(null);
+  const flashTimersRef = useRef<number[]>([]);
 
+  const activeNfcTag = tags.find((t) => t.id === activeTagId) ?? null;
+
+  // Restore permanently flashed firmware from IndexedDB, or build default Bruce .bin
   useEffect(() => {
-    autoConvertRef.current = autoConvertRawToTags;
-  }, [autoConvertRawToTags]);
-
-  const convertPacketInternal = useCallback((pkt: SerialPacket) => {
-    const newTag = convertSerialPacketToNdefTag(pkt);
-    setTagFiles((prev) => [newTag, ...prev]);
-
-    const maybePass = convertSerialPacketToCardPass(pkt);
-    if (maybePass) {
-      setPasses((prev) =>
-        prev.some((existing) => existing.uid.toUpperCase() === maybePass.uid.toUpperCase())
-          ? prev
-          : [maybePass, ...prev]
-      );
-    }
-
-    setConvertedPacketIds((prev) => ({ ...prev, [pkt.id]: true }));
-    return newTag;
+    let active = true;
+    void (async () => {
+      const persisted = await loadPersistedFlashState();
+      if (!active) return;
+      if (persisted) {
+        setFirmware(persisted.firmware);
+        setBootState(persisted.bootState);
+        return;
+      }
+      const built = await buildBruceFirmwareBinary();
+      if (active) setFirmware(built);
+    })();
+    return () => {
+      active = false;
+    };
   }, []);
 
-  const appendPacket = useCallback(
-    (pkt: SerialPacket) => {
-      setPackets((prev) => [pkt, ...prev].slice(0, 120));
-      setUsbState((prev) => ({
-        ...prev,
-        txBytesTotal:
-          pkt.direction === 'TX' ? prev.txBytesTotal + pkt.bytes : prev.txBytesTotal,
-        rxBytesTotal:
-          pkt.direction === 'RX' ? prev.rxBytesTotal + pkt.bytes : prev.rxBytesTotal,
-        txPacketsTotal:
-          pkt.direction === 'TX' ? prev.txPacketsTotal + 1 : prev.txPacketsTotal,
-        rxPacketsTotal:
-          pkt.direction === 'RX' ? prev.rxPacketsTotal + 1 : prev.rxPacketsTotal,
-      }));
-
-      if (autoConvertRef.current && isRawPacketConvertible(pkt)) {
-        convertPacketInternal(pkt);
-      }
-    },
-    [convertPacketInternal]
-  );
-
-  const transmitBytes = useCallback(
-    async (
-      bytes: Uint8Array,
-      hex: string,
-      ascii: string,
-      channel: SerialPacket['channel'],
-      simulatedRxAck?: string
-    ) => {
-      const activePort = serialPortRef.current;
-      if (activePort && usbState.mode === 'webserial') {
-        try {
-          await writeBytesToSerialPort(activePort, bytes);
-        } catch (err) {
-          setStatusNotice(
-            err instanceof Error
-              ? `USB write warning: ${err.message}`
-              : 'USB write interrupted'
-          );
-        }
-      }
-
-      appendPacket(createPacket('TX', channel, hex, ascii, bytes.byteLength));
-
-      if (simulatedRxAck && usbState.mode === 'virtual') {
-        setTimeout(() => {
-          const ackBytes = new TextEncoder().encode(simulatedRxAck);
-          appendPacket(
-            createPacket(
-              'RX',
-              channel,
-              stringToHex(simulatedRxAck),
-              simulatedRxAck,
-              ackBytes.byteLength
-            )
-          );
-        }, 120);
-      }
-    },
-    [appendPacket, usbState.mode]
-  );
-
-  // Persistent TX/RX keep-alive loop: stays streaming while software is active
+  // BroadcastChannel for cross-tab real-time NFC -> Wi-Fi TX/RX sync
   useEffect(() => {
-    if (usbState.mode === 'disconnected' || !usbState.keepAliveEnabled) {
-      return;
-    }
-
-    const sendHeartbeat = () => {
-      const seq = keepAliveSeqRef.current++;
-      const { bytes, hex, ascii } = buildKeepAliveFrame(seq);
-      setUsbState((prev) => ({
-        ...prev,
-        lastHeartbeatAt: formatTimeStamp(),
-      }));
-      void transmitBytes(
-        bytes,
-        hex,
-        ascii,
-        'KEEPALIVE',
-        `[BRUCE_RX] KA_ACK#${seq} TX/RX_LOCKED`
-      );
+    if (typeof BroadcastChannel === 'undefined') return;
+    const channel = new BroadcastChannel('tembed-wifi-txrx');
+    bcRef.current = channel;
+    channel.onmessage = (event: MessageEvent<{ type: string; frame?: TxRxFrame; tag?: NfcTagRecord }>) => {
+      if (event.data?.type === 'RX_FRAME' && event.data.frame) {
+        const frame = event.data.frame;
+        setFrames((prev) => [frame, ...prev].slice(0, 150));
+        setRxPulseAt(Date.now());
+      }
     };
+    return () => {
+      channel.close();
+      bcRef.current = null;
+    };
+  }, []);
 
-    const timer = window.setInterval(sendHeartbeat, 4500);
-    return () => window.clearInterval(timer);
-  }, [usbState.mode, usbState.keepAliveEnabled, transmitBytes]);
+  // Clear flash timers on unmount
+  useEffect(() => {
+    return () => {
+      flashTimersRef.current.forEach((id) => window.clearTimeout(id));
+    };
+  }, []);
 
-  const startSerialReadLoop = useCallback(
-    (port: WebSerialPort) => {
-      if (!port.readable) return;
-      const reader = port.readable.getReader();
-      let cancelled = false;
-      readerCancelRef.current = () => {
-        cancelled = true;
-        void reader.cancel();
-      };
+  const recordFrame = useCallback((frame: TxRxFrame) => {
+    setFrames((prev) => [frame, ...prev].slice(0, 150));
+    setWifiConfig((prev) => ({
+      ...prev,
+      txBytes: frame.direction === 'TX' ? prev.txBytes + frame.bytes : prev.txBytes,
+      rxBytes: frame.direction === 'RX' ? prev.rxBytes + frame.bytes : prev.rxBytes,
+      txFrames: frame.direction === 'TX' ? prev.txFrames + 1 : prev.txFrames,
+      rxFrames: frame.direction === 'RX' ? prev.rxFrames + 1 : prev.rxFrames,
+    }));
+    if (frame.direction === 'TX') setTxPulseAt(Date.now());
+    else setRxPulseAt(Date.now());
+  }, []);
 
-      const decoder = new TextDecoder();
-      void (async () => {
-        try {
-          while (!cancelled) {
-            const { value, done } = await reader.read();
-            if (done || !value) break;
-            const ascii = decoder.decode(value).trim() || '[BINARY_RX_FRAME]';
-            const hex = Array.from(value)
-              .map((b) => b.toString(16).toUpperCase().padStart(2, '0'))
-              .join(' ');
-            appendPacket(createPacket('RX', 'USB->NFC', hex, ascii, value.byteLength));
+  const sendWireCommand = useCallback(
+    (command: string, tagContext?: NfcTagRecord | null) => {
+      if (!wifiConfig.txEnabled) {
+        setToastNotice(`TX line (${wifiConfig.txPin}) is muted in Wi-Fi TX/RX settings.`);
+        return;
+      }
 
-            if (ascii.includes('UID') || ascii.includes('NFC')) {
-              setRelayedReadings((prev) => [
-                {
-                  id: `rx-${Date.now()}`,
-                  timestamp: formatTimeStamp(),
-                  source: 'ESP32-C6 Bruce RX -> Chrome',
-                  uid: ascii.match(/([0-9A-Fa-f]{2}:){3,}[0-9A-Fa-f]{2}/)?.[0] ?? '04:C6:BR:UC:E1',
-                  protocol: 'ISO14443-A',
-                  atqa: '0x0044',
-                  sak: '0x20',
-                  ndefPayload: ascii,
-                  rawFrameHex: hex,
-                  rssiDbm: -45,
-                },
-                ...prev,
-              ]);
-            }
-          }
-        } catch {
-          // Port closed cleanly
-        } finally {
-          reader.releaseLock();
-        }
-      })();
+      const txFrame = buildTxRxFrame('TX', 'WIFI_TX_GPIO43', command, `${command}\n`);
+      recordFrame(txFrame);
+
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(`${command}\n`);
+      }
+
+      bcRef.current?.postMessage({ type: 'TX_FRAME', frame: txFrame });
+
+      if (wifiConfig.rxEnabled && wifiConfig.transport === 'onboard-tunnel') {
+        window.setTimeout(() => {
+          const ackText = createEsp32BruceTxAck(command, tagContext ?? activeNfcTag);
+          const rxFrame = buildTxRxFrame('RX', 'WIFI_RX_GPIO44', ackText, `${ackText}\n`);
+          recordFrame(rxFrame);
+        }, 110);
+      }
     },
-    [appendPacket]
+    [
+      activeNfcTag,
+      recordFrame,
+      wifiConfig.rxEnabled,
+      wifiConfig.transport,
+      wifiConfig.txEnabled,
+      wifiConfig.txPin,
+    ]
   );
 
-  const handleConnectWebSerial = async () => {
-    setStatusNotice(null);
-    if (!isWebSerialSupported()) {
-      setStatusNotice(
-        'Web Serial requires Chrome/Edge over HTTPS or localhost. Activated Virtual ESP32-C6 Loopback Bridge so TX/RX streaming remains operational.'
+  const relayTagOverWifi = useCallback(
+    (tag: NfcTagRecord) => {
+      setActiveTagId(tag.id);
+      if (!wifiConfig.rxEnabled) {
+        setToastNotice(`Cannot receive ${tag.uid}: Wi-Fi RX line (${wifiConfig.rxPin}) is disabled.`);
+        return;
+      }
+
+      const encoded = encodeNfcTagForWifiRx(tag);
+      const rxFrame = buildTxRxFrame(
+        'RX',
+        'WIFI_RX_GPIO44',
+        `Phone NFC -> Wi-Fi RX: ${tag.label} (${tag.uid})`,
+        encoded.hex,
+        true
       );
-      setUsbState((prev) => ({
-        ...prev,
-        mode: 'virtual',
-        portName: 'ESP32-C6 Loopback (CDC0)',
-      }));
-      return;
+      recordFrame(rxFrame);
+
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(`${encoded.ascii}\n`);
+      }
+
+      if (wifiConfig.txEnabled && wifiConfig.transport === 'onboard-tunnel') {
+        window.setTimeout(() => {
+          const ack = createEsp32BruceTxAck(encoded.ascii, tag);
+          recordFrame(buildTxRxFrame('TX', 'WIFI_TX_GPIO43', ack, `${ack}\n`));
+        }, 130);
+      }
+    },
+    [recordFrame, wifiConfig.rxEnabled, wifiConfig.rxPin, wifiConfig.transport, wifiConfig.txEnabled]
+  );
+
+  const handleFetchedTag = useCallback(
+    (tag: NfcTagRecord) => {
+      setTags((prev) => [tag, ...prev.filter((item) => item.id !== tag.id)]);
+      setActiveTagId(tag.id);
+
+      const phoneFrame = buildTxRxFrame(
+        'RX',
+        'PHONE_NFC',
+        `Phone NFC Fetched ${tag.uid} (${tag.protocol})`,
+        tag.rawHex,
+        true
+      );
+      recordFrame(phoneFrame);
+
+      if (wifiConfig.autoForwardNfc) {
+        relayTagOverWifi(tag);
+      }
+    },
+    [recordFrame, relayTagOverWifi, wifiConfig.autoForwardNfc]
+  );
+
+  const handleAttachTagImage = useCallback((tagId: string, file: File) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = typeof reader.result === 'string' ? reader.result : undefined;
+      if (!dataUrl) return;
+      setTags((prev) =>
+        prev.map((item) =>
+          item.id === tagId
+            ? { ...item, imageDataUrl: dataUrl, imageName: file.name }
+            : item
+        )
+      );
+      setToastNotice(`Attached image "${file.name}" to tag file in LilyGO inventory.`);
+    };
+    reader.readAsDataURL(file);
+  }, []);
+
+  const flashFirmwareToEmulator = useCallback(
+    (targetFirmware: FirmwareBinaryInfo, forceInterrupt = false) => {
+      if (bootState === 'flashing' && !forceInterrupt) return;
+      flashTimersRef.current.forEach((id) => window.clearTimeout(id));
+      flashTimersRef.current = [];
+
+      setActiveTab('emulator');
+      setBootState('flashing');
+      setFlashProgress(0);
+      setFlashLogs([
+        {
+          step: 'connect',
+          progress: 5,
+          detail: `Connecting to ESP32-S3 bootloader over Wi-Fi/UART (${wifiConfig.baudRate} baud)...`,
+        },
+      ]);
+
+      const stages: Array<{ delay: number; progress: number; step: string; detail: string }> = [
+        {
+          delay: 220,
+          progress: 22,
+          step: 'chip',
+          detail: `ESP32-S3 · ${targetFirmware.projectName || targetFirmware.fileName} (${targetFirmware.version})`,
+        },
+        {
+          delay: 480,
+          progress: 45,
+          step: 'erase',
+          detail: `Erasing flash region at ${targetFirmware.flashOffset} (${targetFirmware.sizeBytes} bytes)...`,
+        },
+        {
+          delay: 780,
+          progress: 74,
+          step: 'write',
+          detail: `Writing segments permanently to SPI Flash (${targetFirmware.segmentCount ?? 3} segments)...`,
+        },
+        {
+          delay: 1080,
+          progress: 92,
+          step: 'verify',
+          detail: `Verified SHA-256 ${targetFirmware.sha256.slice(0, 16)}... OK`,
+        },
+        {
+          delay: 1340,
+          progress: 100,
+          step: 'boot',
+          detail: `Saved permanently to T-Embed SPI Flash -> Booting ${targetFirmware.fileName}...`,
+        },
+      ];
+
+      stages.forEach((stage) => {
+        const id = window.setTimeout(() => {
+          setFlashProgress(stage.progress);
+          setFlashLogs((prev) => [
+            ...prev,
+            { step: stage.step, progress: stage.progress, detail: stage.detail },
+          ]);
+          if (stage.progress === 100) {
+            setBootState('bruce');
+            setActiveApp('menu');
+            void savePersistedFlashState(targetFirmware, 'bruce');
+            recordFrame(
+              buildTxRxFrame(
+                'RX',
+                'BRUCE_CORE',
+                `Permanently flashed & booted ${targetFirmware.fileName} (${targetFirmware.version})`,
+                `BRUCE_BOOT_OK|${targetFirmware.version}`
+              )
+            );
+          }
+        }, stage.delay);
+        flashTimersRef.current.push(id);
+      });
+    },
+    [bootState, recordFrame, wifiConfig.baudRate]
+  );
+
+  const handleInstallBruceFirmware = useCallback(() => {
+    flashFirmwareToEmulator(firmware, false);
+  }, [firmware, flashFirmwareToEmulator]);
+
+  const handleDownloadFirmware = useCallback(() => {
+    triggerFirmwareBinDownload(firmware);
+    setToastNotice(`Downloaded ${firmware.fileName} (${firmware.sizeBytes} bytes).`);
+  }, [firmware]);
+
+  const handleUploadCustomBin = useCallback(
+    async (file: File) => {
+      const parsed = await parseUploadedFirmwareFile(file);
+      setFirmware(parsed);
+      await savePersistedFlashState(parsed, 'bruce');
+      flashFirmwareToEmulator(parsed, true);
+      setToastNotice(`Uploaded & permanently flashed "${parsed.fileName}" (${parsed.version}) to LilyGO T-Embed.`);
+    },
+    [flashFirmwareToEmulator]
+  );
+
+  const handleUploadEmulatorFile = useCallback(
+    async (file: File) => {
+      if (file.type.startsWith('image/')) {
+        setToastNotice('Please select a non-image file (.bin, .nfc, .txt, .hex, .sub, .ir).');
+        return;
+      }
+      if (file.name.toLowerCase().endsWith('.bin')) {
+        await handleUploadCustomBin(file);
+        return;
+      }
+      const text = await file.text();
+      const parsed = parseNfcDumpFileText(file.name, text);
+      handleFetchedTag(parsed);
+      setToastNotice(`Loaded non-image file "${file.name}" into LilyGO T-Embed SD inventory.`);
+    },
+    [handleFetchedTag, handleUploadCustomBin]
+  );
+
+  const handleConnectWebSocket = (url: string) => {
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
     }
 
     try {
-      const port = await requestEsp32SerialPort(usbState.baudRate);
-      serialPortRef.current = port;
-      const info = port.getInfo ? port.getInfo() : {};
-      const vid = info.usbVendorId
-        ? `VID:0x${info.usbVendorId.toString(16).toUpperCase()}`
-        : 'ESP32-C6';
-      setUsbState((prev) => ({
-        ...prev,
-        mode: 'webserial',
-        portName: `USB Serial (${vid})`,
-      }));
-      appendPacket(
-        createPacket(
-          'TX',
-          'SYSTEM',
-          'AA 55 02 04 4F 50 45 4E 0A',
-          `Opened WebSerial port (${vid}) at ${usbState.baudRate} baud`
-        )
-      );
-      startSerialReadLoop(port);
-    } catch (err) {
-      setStatusNotice(
-        err instanceof Error
-          ? `USB port selection skipped: ${err.message}`
-          : 'USB port selection cancelled'
-      );
-    }
-  };
+      const ws = new WebSocket(url);
+      wsRef.current = ws;
+      setWifiConfig((prev) => ({ ...prev, wsUrl: url, transport: 'websocket-lan' }));
 
-  const handleConnectVirtualLoopback = () => {
-    setStatusNotice(null);
-    setUsbState((prev) => ({
-      ...prev,
-      mode: 'virtual',
-      portName: 'ESP32-C6 Loopback (CDC0)',
-    }));
-    appendPacket(
-      createPacket(
-        'TX',
-        'SYSTEM',
-        'AA 55 02 08 4C 4F 4F 50 42 41 43 4B 0A',
-        'Virtual ESP32-C6 Bruce TX/RX Bridge active'
-      )
-    );
-  };
-
-  const handleDisconnectUsb = async () => {
-    if (readerCancelRef.current) {
-      readerCancelRef.current();
-      readerCancelRef.current = null;
-    }
-    if (serialPortRef.current) {
-      try {
-        await serialPortRef.current.close();
-      } catch {
-        // Ignore close errors
-      }
-      serialPortRef.current = null;
-    }
-    setUsbState((prev) => ({
-      ...prev,
-      mode: 'disconnected',
-      portName: 'Disconnected',
-    }));
-    appendPacket(
-      createPacket(
-        'TX',
-        'SYSTEM',
-        'AA 55 00 04 48 41 4C 54 0A',
-        'USB TX/RX bridge disconnected'
-      )
-    );
-  };
-
-  const handleToggleUsbTopBar = () => {
-    if (usbState.mode === 'disconnected') {
-      void handleConnectWebSerial();
-    } else {
-      void handleDisconnectUsb();
-    }
-  };
-
-  const handleToggleWakeLock = async () => {
-    const nav = navigator as Navigator & {
-      wakeLock?: {
-        request: (type: 'screen') => Promise<{ release: () => Promise<void> }>;
+      ws.onopen = () => {
+        setWifiConfig((prev) => ({ ...prev, wsConnected: true }));
+        recordFrame(
+          buildTxRxFrame('TX', 'WIFI_TX_GPIO43', `Connected WebSocket ${url}`, `WS_OPEN ${url}`)
+        );
       };
-    };
 
-    if (usbState.wakeLockActive && wakeLockRef.current) {
-      await wakeLockRef.current.release();
-      wakeLockRef.current = null;
-      setUsbState((prev) => ({ ...prev, wakeLockActive: false }));
-      return;
-    }
+      ws.onmessage = (evt) => {
+        const text = typeof evt.data === 'string' ? evt.data : '[BINARY_WS_RX]';
+        recordFrame(buildTxRxFrame('RX', 'WIFI_RX_GPIO44', text, text));
+      };
 
-    if (nav.wakeLock) {
-      try {
-        const sentinel = await nav.wakeLock.request('screen');
-        wakeLockRef.current = sentinel;
-        setUsbState((prev) => ({ ...prev, wakeLockActive: true }));
-        return;
-      } catch {
-        // Fallback state toggle below
-      }
+      ws.onerror = () => {
+        setToastNotice(
+          `Could not reach ${url}. Switched back to Onboard Wi-Fi Tunnel so TX/RX remains operational.`
+        );
+        setWifiConfig((prev) => ({
+          ...prev,
+          wsConnected: false,
+          transport: 'onboard-tunnel',
+          wifiMode: 'AP (192.168.4.1)',
+        }));
+      };
+
+      ws.onclose = () => {
+        setWifiConfig((prev) => ({ ...prev, wsConnected: false }));
+      };
+    } catch {
+      setToastNotice(`Invalid WebSocket URL: ${url}`);
     }
-    setUsbState((prev) => ({ ...prev, wakeLockActive: !prev.wakeLockActive }));
   };
 
-  const handleTapPassToUsb = (pass: NfcCardPass) => {
-    if (usbState.mode === 'disconnected') {
-      handleConnectVirtualLoopback();
+  const handleDisconnectWebSocket = () => {
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
     }
-    const { bytes, hex, ascii } = buildBruceNfcFrame(
-      pass.uid,
-      pass.protocol,
-      pass.ndefRecord
-    );
-    void transmitBytes(
-      bytes,
-      hex,
-      ascii,
-      'NFC->USB',
-      `[BRUCE_C6] RX_NFC_OK UID=${pass.uid} ATQA=${pass.atqa} SAK=${pass.sak}`
-    );
-
-    setRelayedReadings((prev) => [
-      {
-        id: `rel-${Date.now()}`,
-        timestamp: formatTimeStamp(),
-        source: 'Phone WebNFC -> USB TX',
-        uid: pass.uid,
-        protocol: pass.protocol,
-        atqa: pass.atqa,
-        sak: pass.sak,
-        ndefPayload: pass.ndefRecord,
-        rawFrameHex: hex,
-        rssiDbm: -39,
-      },
-      ...prev,
-    ]);
+    setWifiConfig((prev) => ({ ...prev, wsConnected: false }));
   };
 
-  const handleSendCustomNfcPayload = (
-    uid: string,
-    protocol: NfcProtocol,
-    ndef: string
-  ) => {
-    if (usbState.mode === 'disconnected') {
-      handleConnectVirtualLoopback();
-    }
-    const { bytes, hex, ascii } = buildBruceNfcFrame(uid, protocol, ndef);
-    void transmitBytes(
-      bytes,
-      hex,
-      ascii,
-      'NFC->USB',
-      `[BRUCE_C6] CUSTOM_UID_RELAYED ${uid}`
-    );
-    setRelayedReadings((prev) => [
-      {
-        id: `rel-custom-${Date.now()}`,
-        timestamp: formatTimeStamp(),
-        source: 'Phone WebNFC -> USB TX',
-        uid,
-        protocol,
-        atqa: '0x0044',
-        sak: '0x20',
-        ndefPayload: ndef,
-        rawFrameHex: hex,
-        rssiDbm: -41,
-      },
-      ...prev,
-    ]);
-  };
-
-  const handleStartPhysicalWebNfc = async () => {
-    const reader = createNdefReader();
+  const handleQuickPhoneNfcScan = async () => {
+    const reader = createPhoneNdefReader();
     if (!reader) {
-      setStatusNotice(
-        'Physical Web NFC (NDEFReader) is supported on Android Chrome. Desktop mode ready: use Tap & Send TX/RX or Custom Frame Injector.'
-      );
-      setUsbState((prev) => ({ ...prev, webNfcScanning: !prev.webNfcScanning }));
+      // Trigger active/next preset tag across Wi-Fi TX/RX for instant desktop testing
+      const currentIdx = tags.findIndex((t) => t.id === activeTagId);
+      const nextTag = tags[(currentIdx + 1) % tags.length] ?? tags[0];
+      if (nextTag) {
+        relayTagOverWifi(nextTag);
+        setToastNotice(
+          `Desktop fallback: Received "${nextTag.label}" (${nextTag.uid}) on Wi-Fi RX (${wifiConfig.rxPin}). Open "NFC Fetch" for Android Web NFC & custom tags.`
+        );
+      }
       return;
     }
 
     try {
       await reader.scan();
-      setUsbState((prev) => ({ ...prev, webNfcScanning: true }));
-      setStatusNotice('Web NFC listener active. Hold an NFC tag to the back of your Android phone.');
+      setToastNotice('Hold an NFC tag to your phone antenna...');
       reader.onreading = (event) => {
-        const uid = event.serialNumber || '04:WE:BN:FC:00:01';
-        const firstRecord = event.message.records[0];
-        let decoded = 'WEBNFC_RAW_TAG';
-        if (firstRecord?.data) {
-          decoded = new TextDecoder().decode(firstRecord.data);
-        }
-        handleSendCustomNfcPayload(uid, 'ISO14443-A', decoded);
-      };
-      reader.onreadingerror = () => {
-        setStatusNotice('NFC read error: hold tag steady near phone antenna.');
+        const uid = event.serialNumber?.toUpperCase() || '04:PH:0N:E1:NF:C0';
+        const rec = event.message.records[0];
+        const payload = rec?.data ? new TextDecoder().decode(rec.data) : 'PHONE_NFC_TAG';
+        handleFetchedTag({
+          id: `phone-${Date.now()}`,
+          label: `Phone NFC (${uid.slice(0, 8)})`,
+          uid,
+          protocol: 'ISO14443-A',
+          atqa: '0x0044',
+          sak: '0x20',
+          ndefType: 'text',
+          payload,
+          rawHex: rec?.data ? dataViewToHexPairs(rec.data) : stringToHexPairs(uid),
+          source: 'phone-webnfc',
+          fetchedAt: formatClockTime(),
+          rssiDbm: -34,
+        });
       };
     } catch (err) {
-      setStatusNotice(
-        err instanceof Error ? `Web NFC error: ${err.message}` : 'Unable to start Web NFC'
-      );
+      setToastNotice(err instanceof Error ? err.message : 'Unable to access phone NFC.');
     }
   };
-
-  const handleSendBruceCommand = (command: string, mode: BruceModuleMode) => {
-    if (usbState.mode === 'disconnected') {
-      handleConnectVirtualLoopback();
-    }
-    const cmdText = `${command}\n`;
-    const bytes = new TextEncoder().encode(cmdText);
-    const hex = stringToHex(cmdText);
-    void transmitBytes(
-      bytes,
-      hex,
-      `CMD> ${command}`,
-      'BRUCE_CMD',
-      `[BRUCE:${mode.toUpperCase()}] EXEC_OK "${command}" -> USB_TXRX_STREAMING`
-    );
-  };
-
-  const handleSimulateEsp32TagRead = () => {
-    const sample = passes[Math.floor(Math.random() * passes.length)];
-    const { bytes, hex } = buildBruceNfcFrame(
-      sample.uid,
-      sample.protocol,
-      `ESP32_C6_RF_SCAN|${sample.ndefRecord}`
-    );
-    appendPacket(
-      createPacket(
-        'RX',
-        'USB->NFC',
-        hex,
-        `[ESP32-C6 RX] Read ${sample.uid} (${sample.protocol})`,
-        bytes.byteLength
-      )
-    );
-    setRelayedReadings((prev) => [
-      {
-        id: `esp-${Date.now()}`,
-        timestamp: formatTimeStamp(),
-        source: 'ESP32-C6 Bruce RX -> Chrome',
-        uid: sample.uid,
-        protocol: sample.protocol,
-        atqa: sample.atqa,
-        sak: sample.sak,
-        ndefPayload: sample.ndefRecord,
-        rawFrameHex: hex,
-        rssiDbm: -36 - Math.floor(Math.random() * 14),
-      },
-      ...prev,
-    ]);
-  };
-
-  const handleCreateTagFile = (
-    title: string,
-    recordType: NdefRecordType,
-    payload: string,
-    fileName?: string
-  ) => {
-    const created = buildNdefTagFile(title, recordType, payload, fileName);
-    setTagFiles((prev) => [created, ...prev]);
-  };
-
-  const handleEmulateTagWithPhone = async (tag: NdefTagFile) => {
-    setEmulatingTagId(tag.id);
-
-    // Relay NDEF payload over USB TX/RX if bridge is active
-    if (usbState.mode !== 'disconnected') {
-      const { bytes, hex, ascii } = buildBruceNfcFrame(
-        '04:ND:EF:00:00:01',
-        'NTAG215',
-        tag.payload
-      );
-      void transmitBytes(
-        bytes,
-        hex,
-        `PHONE_EMULATE> ${ascii}`,
-        'NFC->USB',
-        `[BRUCE_C6] NDEF_EMULATE_SYNC ${tag.fileName}`
-      );
-    }
-
-    // Use Web NFC NDEFReader.write when running on Android Chrome
-    const reader = createNdefReader();
-    if (reader && reader.write) {
-      try {
-        await reader.write({
-          records: [
-            {
-              recordType: tag.recordType === 'URI' ? 'url' : 'text',
-              data: tag.payload,
-            },
-          ],
-        });
-        setStatusNotice(`Phone Web NFC broadcast active for ${tag.fileName}.`);
-        return;
-      } catch {
-        setStatusNotice(
-          `Phone HCE / USB NDEF emulation active for ${tag.fileName} (Tap Android NFC target or ESP32-C6).`
-        );
-        return;
-      }
-    }
-
-    setStatusNotice(
-      `Phone NDEF emulation active for ${tag.fileName} (${tag.rawNdefBytes.length} bytes).`
-    );
-  };
-
-  const handleStopEmulation = () => {
-    setEmulatingTagId(null);
-    setStatusNotice('Phone NDEF emulation stopped.');
-  };
-
-  const handleConvertPacketToTag = (pkt: SerialPacket) => {
-    if (convertedPacketIds[pkt.id]) {
-      setStatusNotice('Reading already converted into a tag in Tag List.');
-      return;
-    }
-    const created = convertPacketInternal(pkt);
-    setStatusNotice(
-      `Converted raw ${pkt.direction} reading into tag ${created.fileName} (${created.recordType}).`
-    );
-  };
-
-  const handleConvertAllRawPackets = () => {
-    const candidates = packets.filter(
-      (pkt) => !convertedPacketIds[pkt.id] && isRawPacketConvertible(pkt)
-    );
-    if (candidates.length === 0) {
-      setStatusNotice(
-        'No unconverted raw data readings in the stream. Tap a pass, run a Bruce scan, or click -> Tag on any row.'
-      );
-      return;
-    }
-
-    const createdTags: NdefTagFile[] = [];
-    const createdPasses: NfcCardPass[] = [];
-    const newConvertedMap: Record<string, boolean> = {};
-
-    for (const pkt of candidates) {
-      createdTags.push(convertSerialPacketToNdefTag(pkt));
-      const pass = convertSerialPacketToCardPass(pkt);
-      if (pass) {
-        createdPasses.push(pass);
-      }
-      newConvertedMap[pkt.id] = true;
-    }
-
-    setTagFiles((prev) => [...createdTags, ...prev]);
-    if (createdPasses.length > 0) {
-      setPasses((prev) => {
-        const next = [...prev];
-        for (const p of createdPasses) {
-          if (!next.some((existing) => existing.uid.toUpperCase() === p.uid.toUpperCase())) {
-            next.unshift(p);
-          }
-        }
-        return next;
-      });
-    }
-    setConvertedPacketIds((prev) => ({ ...prev, ...newConvertedMap }));
-    setStatusNotice(
-      `Converted ${createdTags.length} raw stream reading${createdTags.length === 1 ? '' : 's'} into NDEF tags in Tag List.`
-    );
-  };
-
-  const handleDownloadAllTags = async () => {
-    const zipBytes = await buildAllTagsArchiveBytes(tagFiles, passes, packets);
-    const filename = 'BruceLink-All-Tags-Bundle.zip';
-    triggerBrowserDownload(zipBytes, filename, 'application/zip');
-    setStatusNotice(
-      `Exported ${filename} (${tagFiles.length} .ndef files, ${passes.length} .nfc backups, ${packets.length} TX/RX frames).`
-    );
-  };
-
-  const renderNfcBridge = () => (
-    <NfcBridgePage
-      passes={passes}
-      selectedPassId={selectedPassId}
-      onSelectPass={setSelectedPassId}
-      usbState={usbState}
-      packets={packets}
-      convertedPacketIds={convertedPacketIds}
-      autoConvertRawToTags={autoConvertRawToTags}
-      onToggleAutoConvertRaw={() => {
-        setAutoConvertRawToTags((prev) => {
-          const next = !prev;
-          setStatusNotice(
-            next
-              ? 'Auto-Tag enabled: incoming raw TX/RX NFC readings will automatically convert into NDEF tags.'
-              : 'Auto-Tag paused. Use Convert Raw -> Tags or -> Tag per row anytime.'
-          );
-          return next;
-        });
-      }}
-      onConvertPacketToTag={handleConvertPacketToTag}
-      onConvertAllRawPackets={handleConvertAllRawPackets}
-      onConnectWebSerial={() => void handleConnectWebSerial()}
-      onConnectVirtualLoopback={handleConnectVirtualLoopback}
-      onDisconnectUsb={() => void handleDisconnectUsb()}
-      onToggleKeepAlive={() =>
-        setUsbState((prev) => ({
-          ...prev,
-          keepAliveEnabled: !prev.keepAliveEnabled,
-        }))
-      }
-      onToggleWakeLock={() => void handleToggleWakeLock()}
-      onChangeBaudRate={(baudRate) =>
-        setUsbState((prev) => ({ ...prev, baudRate }))
-      }
-      onToggleDtr={() => {
-        const nextDtr = !usbState.dtr;
-        setUsbState((prev) => ({ ...prev, dtr: nextDtr }));
-        if (serialPortRef.current?.setSignals) {
-          void serialPortRef.current.setSignals({ dataTerminalReady: nextDtr });
-        }
-      }}
-      onToggleRts={() => {
-        const nextRts = !usbState.rts;
-        setUsbState((prev) => ({ ...prev, rts: nextRts }));
-        if (serialPortRef.current?.setSignals) {
-          void serialPortRef.current.setSignals({ requestToSend: nextRts });
-        }
-      }}
-      onStartPhysicalWebNfc={() => void handleStartPhysicalWebNfc()}
-      onTapPassToUsb={handleTapPassToUsb}
-      onSendCustomNfcPayload={handleSendCustomNfcPayload}
-      onClearPackets={() => setPackets([])}
-      onDownloadAllTags={() => void handleDownloadAllTags()}
-    />
-  );
-
-  const renderBruceCompanion = () => (
-    <BruceCompanionPage
-      usbState={usbState}
-      relayedReadings={relayedReadings}
-      passes={passes}
-      onConnectWebSerial={() => void handleConnectWebSerial()}
-      onConnectVirtualLoopback={handleConnectVirtualLoopback}
-      onSendBruceCommand={handleSendBruceCommand}
-      onSimulateEsp32TagRead={handleSimulateEsp32TagRead}
-      onRelayPassToBruce={(pass) => {
-        handleTapPassToUsb(pass);
-      }}
-    />
-  );
 
   return (
-    <div className="min-h-screen flex flex-col bg-[#F6F7F9] text-slate-900 pb-20 md:pb-12">
-      <TopBar
-        activePage={activePage}
-        onSelectPage={setActivePage}
-        usbState={usbState}
-        onToggleUsb={handleToggleUsbTopBar}
+    <div className="min-h-screen flex flex-col bg-[#F8FAFC] text-slate-900">
+      <TopNav
+        activeTab={activeTab}
+        onSelectTab={setActiveTab}
+        onInstallFirmwareClick={handleInstallBruceFirmware}
+        isFlashing={bootState === 'flashing'}
       />
 
-      <main className="flex-1 max-w-[1380px] w-full mx-auto px-4 sm:px-6 pt-6">
-        {(activePage === 'bridge' || activePage === 'bruce') && (
-          <div className="mb-6 flex flex-wrap items-center justify-between gap-3 bg-white border border-slate-200 rounded-xl px-4 py-2.5">
-            <div className="text-xs text-slate-600">
-              Workspace Mode: <strong className="text-slate-950">{combinedDualMode ? 'Option 1 + Option 2 Active Together' : 'Single Option View'}</strong>
-            </div>
-            <div className="flex flex-wrap items-center gap-2">
-              <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg">
-                <button
-                  type="button"
-                  onClick={() => setCombinedDualMode(true)}
-                  className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors cursor-pointer ${
-                    combinedDualMode
-                      ? 'bg-slate-900 text-white'
-                      : 'text-slate-600 hover:text-slate-900'
-                  }`}
-                >
-                  Use Both (Option 1 + 2)
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setCombinedDualMode(false)}
-                  className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors cursor-pointer ${
-                    !combinedDualMode
-                      ? 'bg-white text-slate-900 shadow-sm'
-                      : 'text-slate-600 hover:text-slate-900'
-                  }`}
-                >
-                  Single Option
-                </button>
-              </div>
-              <button
-                type="button"
-                onClick={() => void handleDownloadAllTags()}
-                className="px-3.5 py-1.5 text-xs font-semibold text-slate-900 bg-white border border-slate-300 hover:bg-slate-50 rounded-lg transition-colors whitespace-nowrap cursor-pointer"
-              >
-                Download Tags
-              </button>
-              <button
-                type="button"
-                onClick={() => setActivePage('ndef')}
-                className="px-3.5 py-1.5 text-xs font-semibold text-white bg-orange-600 hover:bg-orange-700 rounded-lg transition-colors whitespace-nowrap cursor-pointer"
-              >
-                Open Tag List ({tagFiles.length})
-              </button>
-            </div>
-          </div>
-        )}
-
-        {statusNotice && (
-          <div className="mb-6 bg-slate-900 text-slate-100 rounded-xl px-4 py-3 text-xs flex items-center justify-between gap-4">
-            <span>{statusNotice}</span>
+      <main className="flex-1 max-w-[1400px] w-full mx-auto px-4 sm:px-6 py-7 space-y-6">
+        {toastNotice && (
+          <div className="bg-slate-900 text-slate-100 rounded-xl px-4 py-3 text-xs flex items-center justify-between gap-4">
+            <span>{toastNotice}</span>
             <button
               type="button"
-              onClick={() => setStatusNotice(null)}
-              className="text-orange-400 hover:text-orange-300 font-semibold whitespace-nowrap shrink-0 cursor-pointer"
+              onClick={() => setToastNotice(null)}
+              className="text-orange-400 hover:text-orange-300 font-semibold shrink-0 cursor-pointer"
             >
               Dismiss
             </button>
           </div>
         )}
 
-        {(activePage === 'bridge' || activePage === 'bruce') && combinedDualMode ? (
-          <div className="space-y-12">
-            {activePage === 'bruce' ? (
-              <>
-                <div>{renderBruceCompanion()}</div>
-                <div className="border-t border-slate-200 pt-10">{renderNfcBridge()}</div>
-                <div className="border-t border-slate-200 pt-10">
-                  <NdefTagFilesPage
-                    tagFiles={tagFiles}
-                    emulatingTagId={emulatingTagId}
-                    usbState={usbState}
-                    onCreateTagFile={handleCreateTagFile}
-                    onEmulateTagWithPhone={(tag) => void handleEmulateTagWithPhone(tag)}
-                    onStopEmulation={handleStopEmulation}
-                  />
-                </div>
-              </>
-            ) : (
-              <>
-                <div>{renderNfcBridge()}</div>
-                <div className="border-t border-slate-200 pt-10">{renderBruceCompanion()}</div>
-                <div className="border-t border-slate-200 pt-10">
-                  <NdefTagFilesPage
-                    tagFiles={tagFiles}
-                    emulatingTagId={emulatingTagId}
-                    usbState={usbState}
-                    onCreateTagFile={handleCreateTagFile}
-                    onEmulateTagWithPhone={(tag) => void handleEmulateTagWithPhone(tag)}
-                    onStopEmulation={handleStopEmulation}
-                  />
-                </div>
-              </>
-            )}
-          </div>
-        ) : (
+        {activeTab === 'emulator' && (
           <>
-            {activePage === 'bridge' && renderNfcBridge()}
-            {activePage === 'bruce' && renderBruceCompanion()}
+            <LilyGoTEmbedEmulator
+              bootState={bootState}
+              firmware={firmware}
+              flashLogs={flashLogs}
+              flashProgress={flashProgress}
+              activeApp={activeApp}
+              onChangeApp={setActiveApp}
+              activeNfcTag={activeNfcTag}
+              savedTags={tags}
+              wifiConfig={wifiConfig}
+              recentFrames={frames}
+              txPulseAt={txPulseAt}
+              rxPulseAt={rxPulseAt}
+              onInstallFirmware={handleInstallBruceFirmware}
+              onDownloadFirmware={handleDownloadFirmware}
+              onUploadCustomBin={(file) => void handleUploadCustomBin(file)}
+              onUploadEmulatorFile={(file) => void handleUploadEmulatorFile(file)}
+              onRebootDevice={() => {
+                if (bootState === 'bruce') {
+                  setActiveApp('menu');
+                  sendWireCommand('system_reboot');
+                } else {
+                  handleInstallBruceFirmware();
+                }
+              }}
+              onResetToStock={() => {
+                setBootState('stock');
+                setActiveApp('menu');
+                setFlashProgress(0);
+                setFlashLogs([]);
+                void clearPersistedFlashState();
+              }}
+              onSendWireCommand={(cmd) => sendWireCommand(cmd)}
+              onRelayTagOverWifi={relayTagOverWifi}
+              onAttachTagImage={handleAttachTagImage}
+              onOpenNfcFetchTab={() => setActiveTab('nfc-fetch')}
+              onToggleWifiAutoForward={() =>
+                setWifiConfig((prev) => ({
+                  ...prev,
+                  autoForwardNfc: !prev.autoForwardNfc,
+                }))
+              }
+            />
+
+            {/* Compact Phone NFC -> Onboard Wi-Fi TX/RX Live Strip */}
+            <section className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              <div className="bg-white border border-slate-200 rounded-xl p-5 flex flex-col justify-between gap-4">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <div className="flex items-center gap-2 text-slate-900 font-display font-semibold text-base">
+                      <Nfc className="w-4 h-4 text-orange-600" />
+                      <span>Phone NFC Hardware Feed</span>
+                    </div>
+                    <p className="text-xs text-slate-500 mt-1">
+                      Fetch NFC tags from your phone and stream them into the T-Embed&apos;s onboard Wi-Fi RX ({wifiConfig.rxPin}) line.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab('nfc-fetch')}
+                    className="text-xs font-semibold text-orange-600 hover:text-orange-700 whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    Open NFC Fetch
+                  </button>
+                </div>
+
+                {activeNfcTag && (
+                  <div className="bg-slate-50 border border-slate-200 rounded-lg p-3.5 text-xs font-mono space-y-1">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="font-semibold text-slate-900">{activeNfcTag.label}</span>
+                      <span className="text-slate-500">{activeNfcTag.protocol}</span>
+                    </div>
+                    <div className="text-cyan-700 font-semibold tabular-nums">
+                      UID: {activeNfcTag.uid}
+                    </div>
+                    <div className="text-slate-600 truncate">{activeNfcTag.payload}</div>
+                  </div>
+                )}
+
+                <div className="flex flex-wrap items-center gap-2.5">
+                  <button
+                    type="button"
+                    onClick={() => void handleQuickPhoneNfcScan()}
+                    className="px-4 py-2 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 rounded-lg cursor-pointer"
+                  >
+                    Fetch Phone NFC &amp; Wire RX
+                  </button>
+                  {activeNfcTag && (
+                    <button
+                      type="button"
+                      onClick={() => relayTagOverWifi(activeNfcTag)}
+                      className="px-4 py-2 text-xs font-semibold text-slate-800 bg-slate-100 hover:bg-slate-200 rounded-lg cursor-pointer"
+                    >
+                      Re-Receive Active Tag
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              <div className="bg-white border border-slate-200 rounded-xl p-5 flex flex-col justify-between gap-4">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <div className="flex items-center gap-2 text-slate-900 font-display font-semibold text-base">
+                      <Wifi className="w-4 h-4 text-cyan-600" />
+                      <span>Onboard Wi-Fi RX / TX Wire ({wifiConfig.rxPin} · {wifiConfig.txPin})</span>
+                    </div>
+                    <p className="text-xs text-slate-500 mt-1 tabular-nums">
+                      {wifiConfig.ssid} · {wifiConfig.rxBytes} B RX / {wifiConfig.txBytes} B TX
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab('wifi-bridge')}
+                    className="text-xs font-semibold text-orange-600 hover:text-orange-700 whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    Inspect RX/TX
+                  </button>
+                </div>
+
+                <div className="bg-slate-950 text-slate-200 rounded-lg p-3.5 font-mono text-xs space-y-1.5 max-h-32 overflow-y-auto">
+                  {frames.slice(0, 4).map((frm) => (
+                    <div key={frm.id} className="flex items-center gap-2.5">
+                      <span className="text-slate-500 tabular-nums shrink-0">{frm.timestamp}</span>
+                      <span
+                        className={`font-bold shrink-0 ${
+                          frm.direction === 'TX' ? 'text-orange-400' : 'text-cyan-400'
+                        }`}
+                      >
+                        {frm.direction}
+                      </span>
+                      <span className="truncate">{frm.summary}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </section>
           </>
         )}
 
-        {activePage === 'ndef' && (
-          <NdefTagFilesPage
-            tagFiles={tagFiles}
-            emulatingTagId={emulatingTagId}
-            usbState={usbState}
-            onCreateTagFile={handleCreateTagFile}
-            onEmulateTagWithPhone={(tag) => void handleEmulateTagWithPhone(tag)}
-            onStopEmulation={handleStopEmulation}
-          />
-        )}
-
-        {activePage === 'download' && <ExtensionDownloadPage />}
-
-        {activePage === 'apk' && (
-          <ApkBuilderPage
-            passes={passes}
-            tagFiles={tagFiles}
-            emulatingTagId={emulatingTagId}
-            onTapPassToUsb={handleTapPassToUsb}
-            onSendBruceCommand={(cmd) => handleSendBruceCommand(cmd, 'relay')}
-            onEmulateTagWithPhone={(tag) => void handleEmulateTagWithPhone(tag)}
-            onStopEmulation={handleStopEmulation}
-            onOpenFullMode={(page, both) => {
-              setCombinedDualMode(Boolean(both));
-              setActivePage(page);
+        {activeTab === 'nfc-fetch' && (
+          <NfcFetchPanel
+            tags={tags}
+            activeTagId={activeTagId}
+            wifiConfig={wifiConfig}
+            onFetchedTag={handleFetchedTag}
+            onAttachTagImage={handleAttachTagImage}
+            onSelectAndWireTag={(tag) => {
+              relayTagOverWifi(tag);
+              setToastNotice(`Received ${tag.uid} on Wi-Fi ${wifiConfig.rxPin} (LilyGO T-Embed RX).`);
+            }}
+            onOpenEmulator={() => {
+              setActiveTab('emulator');
+              if (bootState === 'bruce') setActiveApp('nfc');
             }}
           />
         )}
+
+        {activeTab === 'wifi-bridge' && (
+          <WifiTxRxPanel
+            wifiConfig={wifiConfig}
+            frames={frames}
+            activeNfcTag={activeNfcTag}
+            onUpdateConfig={(patch) => setWifiConfig((prev) => ({ ...prev, ...patch }))}
+            onConnectWebSocket={handleConnectWebSocket}
+            onDisconnectWebSocket={handleDisconnectWebSocket}
+            onSendCommand={(cmd) => sendWireCommand(cmd)}
+            onRelayActiveNfc={() => {
+              if (activeNfcTag) relayTagOverWifi(activeNfcTag);
+            }}
+            onClearFrames={() => setFrames([])}
+          />
+        )}
+
+        {activeTab === 'firmware' && (
+          <FirmwarePanel
+            firmware={firmware}
+            bootState={bootState}
+            flashProgress={flashProgress}
+            flashLogs={flashLogs}
+            onInstallFirmware={handleInstallBruceFirmware}
+            onDownloadFirmware={handleDownloadFirmware}
+            onUploadCustomBin={(file) => void handleUploadCustomBin(file)}
+            onResetToStock={() => {
+              setBootState('stock');
+              setActiveApp('menu');
+              setFlashProgress(0);
+              setFlashLogs([]);
+              void clearPersistedFlashState();
+            }}
+          />
+        )}
+
+        {activeTab === 'carrier-unlock' && <CarrierUnlockPanel />}
       </main>
     </div>
   );
